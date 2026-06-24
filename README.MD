@@ -2,8 +2,6 @@
 
 A Koha plugin for logging reference interactions and capturing **Stories of Impact** — the moments that show a library's value. It gives front-desk staff a fast way to record day-to-day reference work and gives administrators reports and exports that turn that activity into evidence.
 
-LibraryTrack is a standalone product. It is **not** part of the Library Staff Scheduling System that also lives in this monorepo — different purpose, branding, and database tables.
-
 ## Features
 
 - **Log Interaction** — record reference interactions with configurable pickers (Type, Duration, Asked By, Format, Location), a question/answer pair, space-separated tags (with most-used tags promoted as quick chips), and time/date/initials. Supports "Save" and "Save & add another", with a paginated, editable list of recent entries.
