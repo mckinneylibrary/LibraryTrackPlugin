@@ -1,0 +1,33 @@
+[% USE raw %]
+[% INCLUDE 'doc-head-open.inc' %]
+<title>LibraryTrack &rsaquo; [% 'Koha' | html %]</title>
+[% INCLUDE 'doc-head-close.inc' %]
+[% INCLUDE 'header.inc' %]
+[% INCLUDE 'cat-search.inc' %]
+
+<style>
+  #root { width: 100%; min-height: calc(100vh - 80px); }
+</style>
+
+<div id="breadcrumbs">
+  <a href="/cgi-bin/koha/mainpage.pl">Home</a>
+  &rsaquo; LibraryTrack
+</div>
+
+<div class="main container-fluid">
+  <div id="root"></div>
+</div>
+
+<script>
+  /* Koha API base for the React bundle. Use the JS-escaped form so '&'
+     isn't HTML-entity-encoded inside this <script> block (the browser
+     would not decode it, breaking the URL). */
+  window.__KOHA_API_BASE__ = [% api_base_js | $raw %];
+</script>
+
+<!-- React bundle is served by the plugin's own asset() method so it works
+     regardless of how Apache/Plack maps /plugin/<class>/htdocs/ -->
+<link rel="stylesheet" href="[% asset_base %]index.css" />
+<script type="module" src="[% asset_base %]index.js"></script>
+
+[% INCLUDE 'intranet-bottom.inc' %]
