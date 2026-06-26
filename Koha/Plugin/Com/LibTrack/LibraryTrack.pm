@@ -7,7 +7,9 @@ use Koha::Patrons;
 use JSON qw(encode_json decode_json);
 use Data::UUID;
 use Try::Tiny;
+use Carp;
 
+## no critic (Variables::ProhibitPackageVars)
 our $VERSION = '1.0.0';
 our $metadata = {
     name            => 'LibraryTrack',
@@ -20,6 +22,7 @@ our $metadata = {
     version         => $VERSION,
     configure       => 0,
 };
+## use critic
 
 sub new {
     my ( $class, $args ) = @_;
@@ -35,7 +38,7 @@ sub install {
     my ( $self, $args ) = @_;
     my $dbh = C4::Context->dbh;
 
-    $dbh->do(q{
+    $dbh->do(<<'SQL');
         CREATE TABLE IF NOT EXISTS `koha_plugin_libtrack_interactions` (
             `id`               VARCHAR(36)  NOT NULL,
             `type`             VARCHAR(255) NULL,
@@ -54,9 +57,9 @@ sub install {
             PRIMARY KEY (`id`),
             KEY `idx_date` (`interaction_date`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-    });
+SQL
 
-    $dbh->do(q{
+    $dbh->do(<<'SQL');
         CREATE TABLE IF NOT EXISTS `koha_plugin_libtrack_stories` (
             `id`          VARCHAR(36)  NOT NULL,
             `narrative`   TEXT         NULL,
@@ -72,17 +75,17 @@ sub install {
             PRIMARY KEY (`id`),
             KEY `idx_date` (`story_date`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-    });
+SQL
 
     # Field configuration (labels, dropdown options, promoted tags) is
     # stored as a single JSON blob under a fixed key.
-    $dbh->do(q{
+    $dbh->do(<<'SQL');
         CREATE TABLE IF NOT EXISTS `koha_plugin_libtrack_config` (
             `config_key`   VARCHAR(64) NOT NULL,
             `config_value` LONGTEXT    NULL,
             PRIMARY KEY (`config_key`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-    });
+SQL
 
     return 1;
 }
@@ -94,12 +97,19 @@ sub upgrade {
     # table is gone). Best-effort migration for installs created before this:
     # add the photo_url column and drop the obsolete photos table.
     my $dbh = C4::Context->dbh;
-    eval {
-        $dbh->do(
-            'ALTER TABLE `koha_plugin_libtrack_stories` ADD COLUMN `photo_url` TEXT NULL'
-        );
+    
+    my $alter_success = eval {
+        $dbh->do('ALTER TABLE `koha_plugin_libtrack_stories` ADD COLUMN `photo_url` TEXT NULL');
+        1;
     };
-    eval { $dbh->do('DROP TABLE IF EXISTS `koha_plugin_libtrack_photos`') };
+    carp "Failed to alter table during upgrade: $@" if !$alter_success;
+
+    my $drop_success = eval { 
+        $dbh->do('DROP TABLE IF EXISTS `koha_plugin_libtrack_photos`'); 
+        1; 
+    };
+    carp "Failed to drop old photos table: $@" if !$drop_success;
+
     return 1;
 }
 
@@ -116,15 +126,24 @@ sub uninstall {
 
 sub tool {
     my ( $self, $args ) = @_;
+    my $cgi = $self->{cgi};
+
+    # Enforce global authentication check for all tool/asset/api routes
+    my $env = C4::Context->userenv;
+    unless ( $env && $env->{number} ) {
+        print $cgi->header( -status => '401 Unauthorized', -type => 'text/plain' );
+        print "Unauthorized";
+        return 1;
+    }
 
     # Route both the JSON API and the static bundle through method=tool so
     # they ride on the "Use tool plugins" permission rather than the
     # superlibrarian-only plugins.manage (which method=api / method=asset
     # require). Disambiguate by query param.
-    if ( defined scalar $self->{cgi}->param('endpoint') ) {
+    if ( defined scalar $cgi->param('endpoint') ) {
         return $self->api($args);
     }
-    if ( defined scalar $self->{cgi}->param('asset') ) {
+    if ( defined scalar $cgi->param('asset') ) {
         return $self->asset($args);
     }
 
@@ -133,8 +152,8 @@ sub tool {
     my $api_base    = "$run_pl_base&method=tool";
 
     my $api_base_js_escaped = $api_base;
-    $api_base_js_escaped =~ s/\\/\\\\/g;
-    $api_base_js_escaped =~ s/"/\\"/g;
+    $api_base_js_escaped =~ s{\\}{\\\\}gx;
+    $api_base_js_escaped =~ s{"}{\\"}gx;
     my $api_base_js = qq{"$api_base_js_escaped"};
 
     $template->param(
@@ -144,12 +163,20 @@ sub tool {
     );
 
     $self->output_html( $template->output() );
+    return 1;
 }
 
 sub asset {
     my ( $self, $args ) = @_;
     my $cgi  = $self->{'cgi'};
     my $file = scalar $cgi->param('file') // '';
+
+    # Security: Strict validation to prevent path traversal
+    if ( $file !~ m{\A [\w\.\-]+ \z}x ) {
+        print $cgi->header( -status => '400 Bad Request', -type => 'text/plain' );
+        print "Invalid asset request";
+        return;
+    }
 
     my %types = (
         'index.js'    => 'application/javascript; charset=utf-8',
@@ -165,7 +192,7 @@ sub asset {
 
     my $bundle = $self->bundle_path;
     my $path =
-        $file =~ /\.(js|css)$/
+        $file =~ m{\.(js|css)\z}x
         ? "$bundle/htdocs/dist/assets/$file"
         : "$bundle/htdocs/dist/$file";
 
@@ -181,7 +208,7 @@ sub asset {
         print "Read error";
         return;
       };
-    my $content = do { local $/; <$fh> };
+    my $content = do { local $/ = undef; <$fh> };
     close $fh;
 
     print $cgi->header(
@@ -200,6 +227,10 @@ sub _patron_is_superlibrarian {
     my ($borrowernumber) = @_;
     return 0 unless $borrowernumber;
     my $patron = eval { Koha::Patrons->find($borrowernumber) };
+    if ($@) {
+        carp "Error finding patron: $@";
+        return 0;
+    }
     return 0 unless $patron;
     return $patron->is_superlibrarian ? 1 : 0;
 }
@@ -260,7 +291,7 @@ sub _read_body {
 
     my $raw = $cgi->param('POSTDATA') // $cgi->param('PUTDATA') // '';
     if ( !$raw && $ENV{CONTENT_LENGTH} ) {
-        local $/;
+        local $/ = undef;
         read( STDIN, $raw, $ENV{CONTENT_LENGTH} );
     }
     return $raw ? eval { decode_json($raw) } : undef;
@@ -280,7 +311,10 @@ sub _decode_tags {
     return ( ref $arr eq 'ARRAY' ) ? $arr : [];
 }
 
-sub _bool { return $_[0] ? \1 : \0; }
+sub _bool { 
+    my ($val) = @_; 
+    return $val ? \1 : \0; 
+}
 
 # ─── API ──────────────────────────────────────────────────────────────────────
 
@@ -294,17 +328,15 @@ sub api {
     try {
         my $dbh = C4::Context->dbh;
 
-        if ( $endpoint eq 'me' ) {
-            return $self->_api_me;
-        }
-        elsif ( $endpoint eq 'config' ) {
-            return $self->_api_config( $dbh, $method );
-        }
-        elsif ( $endpoint eq 'interactions' ) {
-            return $self->_api_interactions( $dbh, $method, $op, $cgi );
-        }
-        elsif ( $endpoint eq 'stories' ) {
-            return $self->_api_stories( $dbh, $method, $op, $cgi );
+        my %dispatch = (
+            me           => sub { return $self->_api_me() },
+            config       => sub { return $self->_api_config( $dbh, $method ) },
+            interactions => sub { return $self->_api_interactions( $dbh, $method, $op, $cgi ) },
+            stories      => sub { return $self->_api_stories( $dbh, $method, $op, $cgi ) },
+        );
+
+        if ( exists $dispatch{$endpoint} ) {
+            return $dispatch{$endpoint}->();
         }
         else {
             return $self->_json_response( 404, { error => "Unknown endpoint: '$endpoint'" } );
@@ -312,9 +344,11 @@ sub api {
     }
     catch {
         my $err = "$_";
-        warn "LibraryTrack api error: $err";
+        carp "LibraryTrack api error: $err";
         return $self->_json_response( 500, { error => $err } );
     };
+
+    return 1;
 }
 
 sub _api_me {
@@ -356,12 +390,11 @@ sub _api_config {
     my $body = $self->_read_body;
     return $self->_json_response( 400, { error => 'Invalid config body' } )
         unless ref $body eq 'HASH';
-    $dbh->do(
-        q{INSERT INTO koha_plugin_libtrack_config (config_key, config_value)
-          VALUES (?, ?)
-          ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)},
-        undef, 'field_config', encode_json($body),
-    );
+    $dbh->do(<<'SQL', undef, 'field_config', encode_json($body));
+        INSERT INTO koha_plugin_libtrack_config (config_key, config_value)
+        VALUES (?, ?)
+        ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)
+SQL
     return $self->_json_response( 200, $body );
 }
 
@@ -380,7 +413,7 @@ sub _interaction_row_to_hash {
         initials         => $r->{initials}         // '',
         interaction_date => $r->{interaction_date} // '',
         interaction_time => $r->{interaction_time} // '',
-        created_at       => $r->{created_at}        // '',
+        created_at       => $r->{created_at}       // '',
     };
 }
 
@@ -412,18 +445,13 @@ sub _api_interactions {
 
     if ( $op eq 'update' ) {
         my $id = scalar $cgi->param('id');
-        $dbh->do(
-            q{UPDATE koha_plugin_libtrack_interactions SET
+        $dbh->do(<<'SQL', undef, $body->{type}, $body->{duration}, $body->{asked_by}, $body->{format}, $body->{location}, $body->{question}, $body->{answer}, _encode_tags( $body->{tags} ), $body->{initials}, $body->{interaction_date}, $body->{interaction_time}, $id);
+            UPDATE koha_plugin_libtrack_interactions SET
                 type=?, duration=?, asked_by=?, format=?, location=?,
                 question=?, answer=?, tags=?, initials=?,
                 interaction_date=?, interaction_time=?
-              WHERE id=?},
-            undef,
-            $body->{type}, $body->{duration}, $body->{asked_by}, $body->{format},
-            $body->{location}, $body->{question}, $body->{answer},
-            _encode_tags( $body->{tags} ), $body->{initials},
-            $body->{interaction_date}, $body->{interaction_time}, $id,
-        );
+            WHERE id=?
+SQL
         my $row = $dbh->selectrow_hashref(
             'SELECT * FROM koha_plugin_libtrack_interactions WHERE id = ?', undef, $id );
         # Idempotent: a stale/already-deleted id (or a replayed GET-tunneled
@@ -435,17 +463,12 @@ sub _api_interactions {
 
     # Create
     my $id = _uuid();
-    $dbh->do(
-        q{INSERT INTO koha_plugin_libtrack_interactions
+    $dbh->do(<<'SQL', undef, $id, $body->{type}, $body->{duration}, $body->{asked_by}, $body->{format}, $body->{location}, $body->{question}, $body->{answer}, _encode_tags( $body->{tags} ), $body->{initials}, $body->{interaction_date}, $body->{interaction_time}, $env->{number});
+        INSERT INTO koha_plugin_libtrack_interactions
             (id, type, duration, asked_by, format, location, question, answer,
              tags, initials, interaction_date, interaction_time, created_by)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)},
-        undef,
-        $id, $body->{type}, $body->{duration}, $body->{asked_by}, $body->{format},
-        $body->{location}, $body->{question}, $body->{answer},
-        _encode_tags( $body->{tags} ), $body->{initials},
-        $body->{interaction_date}, $body->{interaction_time}, $env->{number},
-    );
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+SQL
     my $row = $dbh->selectrow_hashref(
         'SELECT * FROM koha_plugin_libtrack_interactions WHERE id = ?', undef, $id );
     return $self->_json_response( 201, _interaction_row_to_hash($row) );
@@ -498,28 +521,20 @@ sub _api_stories {
         # photo_url present in body means it changed: null/empty clears it.
         my $has_photo_change = exists $body->{photo_url};
         if ($has_photo_change) {
-            $dbh->do(
-                q{UPDATE koha_plugin_libtrack_stories SET
+            $dbh->do(<<'SQL', undef, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $body->{story_date}, _encode_tags( $body->{tags} ), $body->{photo_url}, $id);
+                UPDATE koha_plugin_libtrack_stories SET
                     narrative=?, outcome=?, patron_type=?, program=?, staff=?,
                     story_date=?, tags=?, photo_url=?
-                  WHERE id=?},
-                undef,
-                $body->{narrative}, $body->{outcome}, $body->{patron_type},
-                $body->{program}, $body->{staff}, $body->{story_date},
-                _encode_tags( $body->{tags} ), $body->{photo_url}, $id,
-            );
+                WHERE id=?
+SQL
         }
         else {
-            $dbh->do(
-                q{UPDATE koha_plugin_libtrack_stories SET
+            $dbh->do(<<'SQL', undef, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $body->{story_date}, _encode_tags( $body->{tags} ), $id);
+                UPDATE koha_plugin_libtrack_stories SET
                     narrative=?, outcome=?, patron_type=?, program=?, staff=?,
                     story_date=?, tags=?
-                  WHERE id=?},
-                undef,
-                $body->{narrative}, $body->{outcome}, $body->{patron_type},
-                $body->{program}, $body->{staff}, $body->{story_date},
-                _encode_tags( $body->{tags} ), $id,
-            );
+                WHERE id=?
+SQL
         }
         my $row = $dbh->selectrow_hashref(
             'SELECT * FROM koha_plugin_libtrack_stories WHERE id = ?', undef, $id );
@@ -532,16 +547,12 @@ sub _api_stories {
 
     # Create
     my $id = _uuid();
-    $dbh->do(
-        q{INSERT INTO koha_plugin_libtrack_stories
+    $dbh->do(<<'SQL', undef, $id, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $body->{story_date}, _encode_tags( $body->{tags} ), $body->{photo_url}, $env->{number});
+        INSERT INTO koha_plugin_libtrack_stories
             (id, narrative, outcome, patron_type, program, staff, story_date,
              tags, photo_url, created_by)
-          VALUES (?,?,?,?,?,?,?,?,?,?)},
-        undef,
-        $id, $body->{narrative}, $body->{outcome}, $body->{patron_type},
-        $body->{program}, $body->{staff}, $body->{story_date},
-        _encode_tags( $body->{tags} ), $body->{photo_url}, $env->{number},
-    );
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+SQL
     my $row = $dbh->selectrow_hashref(
         'SELECT * FROM koha_plugin_libtrack_stories WHERE id = ?', undef, $id );
     return $self->_json_response( 201, $self->_story_row_to_hash( $dbh, $row ) );
