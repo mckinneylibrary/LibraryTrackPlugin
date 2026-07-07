@@ -98,11 +98,21 @@ sub upgrade {
     # add the photo_url column and drop the obsolete photos table.
     my $dbh = C4::Context->dbh;
     
-    my $alter_success = eval {
-        $dbh->do('ALTER TABLE `koha_plugin_libtrack_stories` ADD COLUMN `photo_url` TEXT NULL');
-        1;
-    };
-    carp "Failed to alter table during upgrade: $@" if !$alter_success;
+    # Check via information_schema before ALTER so this is safe to re-run
+    # on any install regardless of MySQL vs MariaDB version.
+    my $col = $dbh->selectrow_arrayref(
+        q{SELECT 1 FROM information_schema.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME   = 'koha_plugin_libtrack_stories'
+            AND COLUMN_NAME  = 'photo_url'},
+    );
+    unless ($col) {
+        my $alter_success = eval {
+            $dbh->do('ALTER TABLE `koha_plugin_libtrack_stories` ADD COLUMN `photo_url` TEXT NULL');
+            1;
+        };
+        carp "Failed to add photo_url column during upgrade: $@" if !$alter_success;
+    }
 
     my $drop_success = eval { 
         $dbh->do('DROP TABLE IF EXISTS `koha_plugin_libtrack_photos`'); 
@@ -411,7 +421,7 @@ sub _interaction_row_to_hash {
         answer           => $r->{answer}           // '',
         tags             => _decode_tags( $r->{tags} ),
         initials         => $r->{initials}         // '',
-        interaction_date => $r->{interaction_date} // '',
+        interaction_date => $r->{interaction_date} || undef,
         interaction_time => $r->{interaction_time} // '',
         created_at       => $r->{created_at}       // '',
     };
@@ -445,7 +455,9 @@ sub _api_interactions {
 
     if ( $op eq 'update' ) {
         my $id = scalar $cgi->param('id');
-        $dbh->do(<<'SQL', undef, $body->{type}, $body->{duration}, $body->{asked_by}, $body->{format}, $body->{location}, $body->{question}, $body->{answer}, _encode_tags( $body->{tags} ), $body->{initials}, $body->{interaction_date}, $body->{interaction_time}, $id);
+        my $interaction_date = ( length( $body->{interaction_date} // '' ) > 0 )
+            ? $body->{interaction_date} : undef;
+        $dbh->do(<<'SQL', undef, $body->{type}, $body->{duration}, $body->{asked_by}, $body->{format}, $body->{location}, $body->{question}, $body->{answer}, _encode_tags( $body->{tags} ), $body->{initials}, $interaction_date, $body->{interaction_time}, $id);
             UPDATE koha_plugin_libtrack_interactions SET
                 type=?, duration=?, asked_by=?, format=?, location=?,
                 question=?, answer=?, tags=?, initials=?,
@@ -462,8 +474,10 @@ SQL
     }
 
     # Create
+    my $interaction_date = ( length( $body->{interaction_date} // '' ) > 0 )
+        ? $body->{interaction_date} : undef;
     my $id = _uuid();
-    $dbh->do(<<'SQL', undef, $id, $body->{type}, $body->{duration}, $body->{asked_by}, $body->{format}, $body->{location}, $body->{question}, $body->{answer}, _encode_tags( $body->{tags} ), $body->{initials}, $body->{interaction_date}, $body->{interaction_time}, $env->{number});
+    $dbh->do(<<'SQL', undef, $id, $body->{type}, $body->{duration}, $body->{asked_by}, $body->{format}, $body->{location}, $body->{question}, $body->{answer}, _encode_tags( $body->{tags} ), $body->{initials}, $interaction_date, $body->{interaction_time}, $env->{number});
         INSERT INTO koha_plugin_libtrack_interactions
             (id, type, duration, asked_by, format, location, question, answer,
              tags, initials, interaction_date, interaction_time, created_by)
@@ -471,6 +485,8 @@ SQL
 SQL
     my $row = $dbh->selectrow_hashref(
         'SELECT * FROM koha_plugin_libtrack_interactions WHERE id = ?', undef, $id );
+    return $self->_json_response( 500, { error => 'Interaction was not saved (INSERT returned no row)' } )
+        unless $row;
     return $self->_json_response( 201, _interaction_row_to_hash($row) );
 }
 
@@ -483,9 +499,9 @@ sub _story_row_to_hash {
         patron_type => $r->{patron_type} // '',
         program     => $r->{program}     // '',
         staff       => $r->{staff}       // '',
-        story_date  => $r->{story_date}  // '',
+        story_date  => $r->{story_date}  || undef,
         tags        => _decode_tags( $r->{tags} ),
-        photo       => $r->{photo_url}   // '',
+        photo       => $r->{photo_url}   || undef,
         created_at  => $r->{created_at}  // '',
     };
 }
@@ -518,10 +534,14 @@ sub _api_stories {
 
     if ( $op eq 'update' ) {
         my $id = scalar $cgi->param('id');
+        # Normalise empty-string dates to NULL: MySQL strict mode (default in
+        # Koha 22.05+) rejects '' for a DATE column with "Incorrect date value".
+        my $story_date = ( length( $body->{story_date} // '' ) > 0 )
+            ? $body->{story_date} : undef;
         # photo_url present in body means it changed: null/empty clears it.
         my $has_photo_change = exists $body->{photo_url};
         if ($has_photo_change) {
-            $dbh->do(<<'SQL', undef, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $body->{story_date}, _encode_tags( $body->{tags} ), $body->{photo_url}, $id);
+            $dbh->do(<<'SQL', undef, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $story_date, _encode_tags( $body->{tags} ), $body->{photo_url}, $id);
                 UPDATE koha_plugin_libtrack_stories SET
                     narrative=?, outcome=?, patron_type=?, program=?, staff=?,
                     story_date=?, tags=?, photo_url=?
@@ -529,7 +549,7 @@ sub _api_stories {
 SQL
         }
         else {
-            $dbh->do(<<'SQL', undef, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $body->{story_date}, _encode_tags( $body->{tags} ), $id);
+            $dbh->do(<<'SQL', undef, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $story_date, _encode_tags( $body->{tags} ), $id);
                 UPDATE koha_plugin_libtrack_stories SET
                     narrative=?, outcome=?, patron_type=?, program=?, staff=?,
                     story_date=?, tags=?
@@ -546,8 +566,10 @@ SQL
     }
 
     # Create
+    my $story_date = ( length( $body->{story_date} // '' ) > 0 )
+        ? $body->{story_date} : undef;
     my $id = _uuid();
-    $dbh->do(<<'SQL', undef, $id, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $body->{story_date}, _encode_tags( $body->{tags} ), $body->{photo_url}, $env->{number});
+    $dbh->do(<<'SQL', undef, $id, $body->{narrative}, $body->{outcome}, $body->{patron_type}, $body->{program}, $body->{staff}, $story_date, _encode_tags( $body->{tags} ), $body->{photo_url}, $env->{number});
         INSERT INTO koha_plugin_libtrack_stories
             (id, narrative, outcome, patron_type, program, staff, story_date,
              tags, photo_url, created_by)
@@ -555,6 +577,8 @@ SQL
 SQL
     my $row = $dbh->selectrow_hashref(
         'SELECT * FROM koha_plugin_libtrack_stories WHERE id = ?', undef, $id );
+    return $self->_json_response( 500, { error => 'Story was not saved (INSERT returned no row)' } )
+        unless $row;
     return $self->_json_response( 201, $self->_story_row_to_hash( $dbh, $row ) );
 }
 
