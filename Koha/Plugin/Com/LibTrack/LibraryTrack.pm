@@ -5,12 +5,11 @@ use base qw(Koha::Plugins::Base);
 use C4::Context;
 use Koha::Patrons;
 use JSON qw(encode_json decode_json);
-use Data::UUID;
 use Try::Tiny;
 use Carp;
 
 ## no critic (Variables::ProhibitPackageVars)
-our $VERSION = '1.0.0';
+our $VERSION = '1.0.2';
 our $metadata = {
     name            => 'LibraryTrack',
     author          => 'LibTrack',
@@ -231,7 +230,18 @@ sub asset {
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-sub _uuid { return lc( Data::UUID->new->create_str ); }
+sub _uuid {
+    # Pure-Perl UUID v4 (RFC 4122) — no external modules required.
+    # Data::UUID is not in Koha's cpanfile and may not be installed.
+    return sprintf(
+        '%08x-%04x-4%03x-%04x-%012x',
+        int( rand(0xFFFFFFFF) ),
+        int( rand(0xFFFF) ),
+        int( rand(0xFFF) ),
+        int( rand(0x3FFF) ) | 0x8000,
+        int( rand(0xFFFFFFFFFFFF) ),
+    );
+}
 
 sub _patron_is_superlibrarian {
     my ($borrowernumber) = @_;
